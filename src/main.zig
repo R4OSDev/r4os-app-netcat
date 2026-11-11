@@ -126,7 +126,9 @@ fn run(ctx: *const App) i32 {
     }
     ctx.write("\r\n");
     if (!r4os.network_stream.complete(received)) {
-        ctx.write("NETCAT result: timeout\r\n");
+        ctx.write("NETCAT result: ");
+        ctx.write(@tagName(@as(r4os.stream_transfer.Outcome, @enumFromInt(received.outcome))));
+        ctx.write("\r\n");
         return 1;
     }
 
@@ -336,7 +338,9 @@ fn sendInteractiveLine(ctx: *const App, socket: *r4os.network_stream.Socket, rea
     const received = reader.read(&reply, false, &budget) catch return false;
     const got: usize = @intCast(received.bytes);
     if (got == 0 or received.flags & r4os.stream_transfer.core.terminal != 0 and received.outcome != @intFromEnum(r4os.stream_transfer.Outcome.eof) and !r4os.network_stream.complete(received)) {
-        ctx.write("NETCAT result: timeout\r\n");
+        ctx.write("NETCAT result: ");
+        ctx.write(@tagName(@as(r4os.stream_transfer.Outcome, @enumFromInt(received.outcome))));
+        ctx.write("\r\n");
         return false;
     }
 
