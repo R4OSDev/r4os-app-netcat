@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const MAX_TCP_PAYLOAD: usize = r4os.abi.net_service_tcp_read_max;
@@ -6,7 +7,7 @@ const DEFAULT_PAYLOAD = "R4NETCAT";
 
 const Options = struct {
     target_text: []const u8,
-    target_ip: [4]u8,
+    target: r4os.abi.NetworkEndpoint,
     port: u16,
     payload: []const u8,
     resolved: bool,
@@ -14,82 +15,62 @@ const Options = struct {
 
 const App = struct {
     sys: r4os.r4sys.Context,
-    desk: r4os.r4desk.Context,
-    net: r4os.r4net.Context,
-
-    fn init(r4_app: *r4os.App) ?App {
-        return .{
-            .sys = r4_app.system(),
-            .desk = r4_app.desktop() orelse return null,
-            .net = r4_app.networkLowLevel() orelse return null,
-        };
-    }
-
-    fn argsRaw(self: *const App) [*:0]const u8 {
-        return self.sys.argsRaw();
-    }
+    output: *r4os.launch_io.Output,
+    network: *r4os.network_stream.Session,
+    budget: *r4os.rpc_budget.Budget,
+    args: []const u8,
+    family: u32,
 
     fn write(self: *const App, value: []const u8) void {
-        self.sys.write(value);
+        self.output.write(value);
     }
-
     fn putc(self: *const App, ch: u8) void {
-        self.sys.putc(ch);
+        self.output.put(ch);
     }
-
     fn printU64(self: *const App, value: u64) void {
-        self.sys.printU64(value);
-    }
-
-    fn taskYield(self: *const App) void {
-        self.sys.taskYield();
-    }
-
-    fn consoleRead(self: *const App, out: []u8) i32 {
-        return self.desk.consoleRead(out);
-    }
-
-    fn netDnsResolveService(self: *const App, name_value: []const u8, out: *[4]u8) i32 {
-        return self.net.netDnsResolveService(name_value, out);
-    }
-
-    fn netDnsResultName(self: *const App, result: i32) []const u8 {
-        return self.net.netDnsResultName(result);
-    }
-
-    fn tcpConnectService(self: *const App, a: u8, b: u8, c: u8, d: u8, port: u16) i32 {
-        return self.net.tcpConnectService(a, b, c, d, port);
-    }
-
-    fn tcpWriteService(self: *const App, handle: u32, data: []const u8) i32 {
-        return self.net.tcpWriteService(handle, data);
-    }
-
-    fn tcpReadService(self: *const App, handle: u32, out: []u8) i32 {
-        return self.net.tcpReadService(handle, out);
-    }
-
-    fn tcpAcceptPollReadService(self: *const App, port: u16, out: []u8, result: *r4os.abi.TcpAcceptResult) i32 {
-        return self.net.tcpAcceptPollReadService(port, out, result);
-    }
-
-    fn tcpCloseService(self: *const App, handle: u32) i32 {
-        return self.net.tcpCloseService(handle);
+        self.output.number(value);
     }
 };
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    const ctx = App.init(r4_app) orelse return r4os.abi.err_no_group;
-    const args = trim(zSlice(ctx.argsRaw()));
-    if (parseListenOptions(args)) |listen| {
-        return listenOnce(&ctx, listen);
+pub fn r4_app_main(app: *r4os.App2) i32 {
+    var output: r4os.launch_io.Output = undefined;
+    if (r4os.launch_io.Output.init(app, &output) != 0) return 1;
+    var selected_family: u32 = 0;
+    const args = r4os.network_stream.arguments(app.args(), &selected_family) orelse {
+        output.write("NETCAT: invalid argument grammar\r\n");
+        _ = output.close();
+        return 1;
+    };
+    var budget = r4os.rpc_budget.Budget.fromTimeout(output.clock.read, .{ .kind = 1, .nanoseconds = 10_000_000_000 }) catch {
+        _ = output.close();
+        return 1;
+    };
+    var network: r4os.network_stream.Session = undefined;
+    const opened = r4os.network_stream.Session.open(app, &budget, &network);
+    if (opened != 0) {
+        output.write("NETCAT: TCPSVC unavailable or invalid\r\n");
+        _ = output.close();
+        return 1;
     }
-    if (parseInteractiveOptions(&ctx, args)) |interactive| {
-        return interactiveSession(&ctx, interactive);
+    const ctx: App = .{ .sys = app.system(), .output = &output, .network = &network, .budget = &budget, .args = args, .family = selected_family };
+    const result = run(&ctx);
+    const closed = network.close();
+    if (closed != 0) output.write("NETCAT close: not confirmed\r\n");
+    const io_closed = output.close();
+    return if (output.failed or closed != 0 or io_closed != 0) 1 else result;
+}
+
+fn run(ctx: *const App) i32 {
+    const args = trim(ctx.args);
+    if (parseListenOptions(args)) |listen| {
+        return listenOnce(ctx, listen);
+    }
+    if (parseInteractiveOptions(ctx, args)) |interactive| {
+        return interactiveSession(ctx, interactive);
     }
 
-    const options = parseOptions(&ctx, args) orelse {
-        usage(&ctx);
+    const options = parseOptions(ctx, args) orelse {
+        usage(ctx);
         return 1;
     };
 
@@ -102,25 +83,25 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         ctx.write("NETCAT resolved ");
         ctx.write(options.target_text);
         ctx.write(" to ");
-        writeIpv4(&ctx, options.target_ip);
+        writeAddress(ctx, options.target.address);
         ctx.write("\r\n");
     }
 
     ctx.write("NETCAT connect ");
-    writeIpv4(&ctx, options.target_ip);
+    writeAddress(ctx, options.target.address);
     ctx.write(":");
     ctx.printU64(options.port);
     ctx.write(": ");
 
-    const conn = ctx.tcpConnectService(options.target_ip[0], options.target_ip[1], options.target_ip[2], options.target_ip[3], options.port);
-    if (conn <= 0) {
+    var socket: r4os.network_stream.Socket = undefined;
+    if (ctx.network.create(options.target, false, ctx.budget, &socket) != 0) {
         ctx.write("failed\r\n");
         return 1;
     }
     ctx.write("ok\r\n");
-
-    const conn_id: u32 = @intCast(conn);
-    const written = ctx.tcpWriteService(conn_id, options.payload);
+    defer socket.close();
+    const sent = socket.writeAll(options.payload, ctx.budget) catch return 1;
+    const written: i32 = @intCast(sent.bytes);
     ctx.write("NETCAT sent: ");
     if (written >= 0) {
         ctx.printU64(@intCast(written));
@@ -128,14 +109,14 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         ctx.write("failed");
     }
     ctx.write("\r\n");
-    if (written < 0 or written != @as(i32, @intCast(options.payload.len))) {
-        _ = ctx.tcpCloseService(conn_id);
+    if (!r4os.network_stream.complete(sent)) {
         return 1;
     }
 
     var reply: [MAX_TCP_PAYLOAD]u8 = undefined;
-    const got = ctx.tcpReadService(conn_id, reply[0..]);
-    _ = ctx.tcpCloseService(conn_id);
+    var reader: r4os.network_stream.Reader = .{ .socket = &socket };
+    const received = reader.read(reply[0..options.payload.len], true, ctx.budget) catch return 1;
+    const got: i32 = @intCast(received.bytes);
 
     ctx.write("NETCAT received: ");
     if (got >= 0) {
@@ -144,7 +125,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
         ctx.write("failed");
     }
     ctx.write("\r\n");
-    if (got <= 0) {
+    if (!r4os.network_stream.complete(received)) {
         ctx.write("NETCAT result: timeout\r\n");
         return 1;
     }
@@ -163,7 +144,7 @@ pub fn r4_app_main(r4_app: *r4os.App) i32 {
 
 const InteractiveOptions = struct {
     target_text: []const u8,
-    target_ip: [4]u8,
+    target: r4os.abi.NetworkEndpoint,
     port: u16,
     resolved: bool,
 };
@@ -179,55 +160,43 @@ fn listenOnce(ctx: *const App, options: ListenOptions) i32 {
         ctx.write("NETCAT: reply too large\r\n");
         return 1;
     }
-
-    var payload: [MAX_TCP_PAYLOAD]u8 = undefined;
-    var accept: r4os.abi.TcpAcceptResult = .{};
-
     ctx.write("NETCAT listen ");
     ctx.printU64(options.port);
     ctx.write(": waiting\r\n");
-
-    const got = ctx.tcpAcceptPollReadService(options.port, payload[0..], &accept);
-    if (got <= 0 or accept.conn_id == 0) {
-        ctx.write("NETCAT listen ");
-        ctx.printU64(options.port);
-        ctx.write(": ");
-        ctx.write(if (got == 0) "timeout\r\n" else "failed\r\n");
+    const endpoint: r4os.abi.NetworkEndpoint = .{ .address = .{ .family = if (ctx.family == 6) 6 else 4 }, .port = options.port };
+    var listener: r4os.network_stream.Socket = undefined;
+    if (ctx.network.create(endpoint, true, ctx.budget, &listener) != 0) return 1;
+    defer listener.close();
+    var socket: r4os.network_stream.Socket = undefined;
+    if (listener.accept(ctx.budget, &socket) != 0) {
+        ctx.write("NETCAT listen: accept failed\r\n");
         return 1;
     }
-
-    const bytes = payload[0..@intCast(got)];
+    defer socket.close();
+    var payload: [MAX_TCP_PAYLOAD]u8 = undefined;
+    var reader: r4os.network_stream.Reader = .{ .socket = &socket };
+    const got = reader.read(&payload, false, ctx.budget) catch return 1;
+    if (got.bytes == 0 or got.flags & r4os.stream_transfer.core.terminal != 0 and got.outcome != @intFromEnum(r4os.stream_transfer.Outcome.eof) and !r4os.network_stream.complete(got)) return 1;
+    const bytes = payload[0..@intCast(got.bytes)];
     ctx.write("NETCAT accepted: conn=");
-    ctx.printU64(accept.conn_id);
+    ctx.printU64(socket.id);
     ctx.write(" bytes=");
-    ctx.printU64(@intCast(got));
-    ctx.write("\r\n");
-    ctx.write("NETCAT received: ");
-    ctx.printU64(@intCast(got));
-    ctx.write("\r\n");
-    ctx.write("NETCAT payload: ");
+    ctx.printU64(got.bytes);
+    ctx.write("\r\nNETCAT received: ");
+    ctx.printU64(got.bytes);
+    ctx.write("\r\nNETCAT payload: ");
     ctx.write(bytes);
     ctx.write("\r\n");
-
     if (options.has_reply) {
-        const written = ctx.tcpWriteService(accept.conn_id, options.reply);
+        const sent = socket.writeAll(options.reply, ctx.budget) catch return 1;
         ctx.write("NETCAT reply-sent: ");
-        if (written >= 0) {
-            ctx.printU64(@intCast(written));
-        } else {
-            ctx.write("failed");
-        }
+        ctx.printU64(sent.bytes);
         ctx.write("\r\n");
-        _ = ctx.tcpCloseService(accept.conn_id);
-        if (written < 0 or written != @as(i32, @intCast(options.reply.len))) {
+        if (!r4os.network_stream.complete(sent)) {
             ctx.write("NETCAT result: write-failed\r\n");
             return 1;
         }
-    } else {
-        _ = ctx.tcpCloseService(accept.conn_id);
-        ctx.write("NETCAT reply-sent: none\r\n");
-    }
-
+    } else ctx.write("NETCAT reply-sent: none\r\n");
     ctx.write("NETCAT result: ok\r\n");
     return 0;
 }
@@ -237,25 +206,25 @@ fn interactiveSession(ctx: *const App, options: InteractiveOptions) i32 {
         ctx.write("NETCAT resolved ");
         ctx.write(options.target_text);
         ctx.write(" to ");
-        writeIpv4(ctx, options.target_ip);
+        writeAddress(ctx, options.target.address);
         ctx.write("\r\n");
     }
 
     ctx.write("NETCAT connect ");
-    writeIpv4(ctx, options.target_ip);
+    writeAddress(ctx, options.target.address);
     ctx.write(":");
     ctx.printU64(options.port);
     ctx.write(": ");
 
-    const conn = ctx.tcpConnectService(options.target_ip[0], options.target_ip[1], options.target_ip[2], options.target_ip[3], options.port);
-    if (conn <= 0) {
+    var socket: r4os.network_stream.Socket = undefined;
+    if (ctx.network.create(options.target, false, ctx.budget, &socket) != 0) {
         ctx.write("failed\r\n");
         return 1;
     }
+    defer socket.close();
+    var reader: r4os.network_stream.Reader = .{ .socket = &socket };
     ctx.write("ok\r\n");
     ctx.write("NETCAT interactive: line mode, single dot or Ctrl+Z ends\r\n");
-
-    const conn_id: u32 = @intCast(conn);
     var input: [128]u8 = undefined;
     var line: [MAX_INTERACTIVE_LINE]u8 = undefined;
     var line_len: usize = 0;
@@ -266,21 +235,25 @@ fn interactiveSession(ctx: *const App, options: InteractiveOptions) i32 {
     var done = false;
 
     while (!done) {
-        const read = ctx.consoleRead(input[0..]);
-        if (read < 0) {
-            _ = ctx.tcpCloseService(conn_id);
+        if (ctx.sys.programShouldClose() or ctx.output.failed) return 1;
+        var progress: r4os.byte_pipe.Progress = .{};
+        const read_rc = ctx.output.io.readChecked(&input, .{}, &progress);
+        if (read_rc != 0 or progress.bytes > input.len or progress.state < r4os.abi.byte_pipe_ready or progress.state > r4os.abi.byte_pipe_closed) {
             ctx.write("NETCAT result: stdin-failed\r\n");
             return 1;
         }
-        if (read == 0) {
-            ctx.taskYield();
+        if (progress.state == r4os.abi.byte_pipe_eof) done = true;
+        if (progress.state == r4os.abi.byte_pipe_cancelled or progress.state == r4os.abi.byte_pipe_closed or progress.state == r4os.abi.byte_pipe_broken_pipe or progress.state == r4os.abi.byte_pipe_timed_out) {
+            ctx.write("NETCAT result: stdin-cancelled\r\n");
+            return 1;
+        }
+        if (progress.bytes == 0 and !done) {
+            ctx.sys.sleepTicks(1);
             continue;
         }
-
-        const bytes = input[0..@intCast(read)];
+        const bytes = input[0..@intCast(progress.bytes)];
         for (bytes) |ch| {
             if (ch == 0x03) {
-                _ = ctx.tcpCloseService(conn_id);
                 ctx.write("NETCAT result: cancelled\r\n");
                 return 1;
             }
@@ -300,8 +273,7 @@ fn interactiveSession(ctx: *const App, options: InteractiveOptions) i32 {
                     done = true;
                     break;
                 }
-                if (!sendInteractiveLine(ctx, conn_id, current, &lines, &total_sent, &total_received)) {
-                    _ = ctx.tcpCloseService(conn_id);
+                if (!sendInteractiveLine(ctx, &socket, &reader, current, &lines, &total_sent, &total_received)) {
                     return 1;
                 }
                 line_len = 0;
@@ -309,7 +281,6 @@ fn interactiveSession(ctx: *const App, options: InteractiveOptions) i32 {
             }
 
             if (line_len >= line.len) {
-                _ = ctx.tcpCloseService(conn_id);
                 ctx.write("NETCAT result: line-too-large\r\n");
                 return 1;
             }
@@ -319,13 +290,11 @@ fn interactiveSession(ctx: *const App, options: InteractiveOptions) i32 {
     }
 
     if (line_len != 0) {
-        if (!sendInteractiveLine(ctx, conn_id, line[0..line_len], &lines, &total_sent, &total_received)) {
-            _ = ctx.tcpCloseService(conn_id);
+        if (!sendInteractiveLine(ctx, &socket, &reader, line[0..line_len], &lines, &total_sent, &total_received)) {
             return 1;
         }
     }
 
-    _ = ctx.tcpCloseService(conn_id);
     ctx.write("NETCAT interactive lines: ");
     ctx.printU64(@intCast(lines));
     ctx.write("\r\n");
@@ -339,7 +308,7 @@ fn interactiveSession(ctx: *const App, options: InteractiveOptions) i32 {
     return 0;
 }
 
-fn sendInteractiveLine(ctx: *const App, conn_id: u32, line: []const u8, lines: *usize, total_sent: *usize, total_received: *usize) bool {
+fn sendInteractiveLine(ctx: *const App, socket: *r4os.network_stream.Socket, reader: *r4os.network_stream.Reader, line: []const u8, lines: *usize, total_sent: *usize, total_received: *usize) bool {
     if (line.len + 2 > MAX_TCP_PAYLOAD) {
         ctx.write("NETCAT result: line-too-large\r\n");
         return false;
@@ -356,15 +325,17 @@ fn sendInteractiveLine(ctx: *const App, conn_id: u32, line: []const u8, lines: *
     writeVisible(ctx, payload[0..send_len]);
     ctx.write("\r\n");
 
-    const written = ctx.tcpWriteService(conn_id, payload[0..send_len]);
-    if (written < 0 or written != @as(i32, @intCast(send_len))) {
+    var budget = r4os.rpc_budget.Budget.fromTimeout(ctx.network.clock.read, .{ .kind = 1, .nanoseconds = 10_000_000_000 }) catch return false;
+    const sent = socket.writeAll(payload[0..send_len], &budget) catch return false;
+    if (!r4os.network_stream.complete(sent)) {
         ctx.write("NETCAT result: write-failed\r\n");
         return false;
     }
 
     var reply: [MAX_TCP_PAYLOAD]u8 = undefined;
-    const got = ctx.tcpReadService(conn_id, reply[0..]);
-    if (got <= 0) {
+    const received = reader.read(&reply, false, &budget) catch return false;
+    const got: usize = @intCast(received.bytes);
+    if (got == 0 or received.flags & r4os.stream_transfer.core.terminal != 0 and received.outcome != @intFromEnum(r4os.stream_transfer.Outcome.eof) and !r4os.network_stream.complete(received)) {
         ctx.write("NETCAT result: timeout\r\n");
         return false;
     }
@@ -391,26 +362,19 @@ fn parseOptions(ctx: *const App, args: []const u8) ?Options {
     rest = port_token.rest;
     const port = parsePort(port_token.token) orelse return null;
 
-    var target_ip: [4]u8 = undefined;
-    var resolved = false;
-    if (parseIpv4(target.token)) |ip| {
-        target_ip = ip;
-    } else {
-        const result = ctx.netDnsResolveService(target.token, &target_ip);
-        if (result != r4os.abi.dns_result_ok) {
-            ctx.write("NETCAT resolve failed for ");
-            ctx.write(target.token);
-            ctx.write(": ");
-            ctx.write(ctx.netDnsResultName(result));
-            ctx.write("\r\n");
-            return null;
-        }
-        resolved = true;
+    var endpoint: r4os.abi.NetworkEndpoint = .{};
+    if (ctx.network.resolve(target.token, port, ctx.family, ctx.budget, &endpoint) != 0) {
+        ctx.write("NETCAT resolve failed for ");
+        ctx.write(target.token);
+        ctx.write("\r\n");
+        return null;
     }
+    const numeric = if (target.token.len >= 2 and target.token[0] == '[') target.token[1 .. target.token.len - 1] else target.token;
+    const resolved = r4os.network_family.parseAddress(numeric) == null;
 
     return .{
         .target_text = target.token,
-        .target_ip = target_ip,
+        .target = endpoint,
         .port = port,
         .payload = if (rest.len == 0) DEFAULT_PAYLOAD else rest,
         .resolved = resolved,
@@ -429,35 +393,28 @@ fn parseInteractiveOptions(ctx: *const App, args: []const u8) ?InteractiveOption
     if (port_token.rest.len != 0) return null;
     const port = parsePort(port_token.token) orelse return null;
 
-    var target_ip: [4]u8 = undefined;
-    var resolved = false;
-    if (parseIpv4(target.token)) |ip| {
-        target_ip = ip;
-    } else {
-        const result = ctx.netDnsResolveService(target.token, &target_ip);
-        if (result != r4os.abi.dns_result_ok) {
-            ctx.write("NETCAT resolve failed for ");
-            ctx.write(target.token);
-            ctx.write(": ");
-            ctx.write(ctx.netDnsResultName(result));
-            ctx.write("\r\n");
-            return null;
-        }
-        resolved = true;
+    var endpoint: r4os.abi.NetworkEndpoint = .{};
+    if (ctx.network.resolve(target.token, port, ctx.family, ctx.budget, &endpoint) != 0) {
+        ctx.write("NETCAT resolve failed for ");
+        ctx.write(target.token);
+        ctx.write("\r\n");
+        return null;
     }
+    const numeric = if (target.token.len >= 2 and target.token[0] == '[') target.token[1 .. target.token.len - 1] else target.token;
+    const resolved = r4os.network_family.parseAddress(numeric) == null;
 
     return .{
         .target_text = target.token,
-        .target_ip = target_ip,
+        .target = endpoint,
         .port = port,
         .resolved = resolved,
     };
 }
 
 fn usage(ctx: *const App) void {
-    ctx.write("Usage: NETCAT host port [text]\r\n");
-    ctx.write("       NETCAT /INTERACTIVE host port\r\n");
-    ctx.write("       NETCAT /LISTEN [port] [reply]\r\n");
+    ctx.write("Usage: NETCAT [-4|-6] host port [text]\r\n");
+    ctx.write("       NETCAT [-4|-6] /INTERACTIVE host port\r\n");
+    ctx.write("       NETCAT [-4|-6] /LISTEN [port] [reply]\r\n");
 }
 
 fn parseListenOptions(args: []const u8) ?ListenOptions {
@@ -482,70 +439,24 @@ fn parseListenOptions(args: []const u8) ?ListenOptions {
     };
 }
 
-const Token = struct {
-    token: []const u8,
-    rest: []const u8,
-};
-
+const Token = struct { token: []const u8, rest: []const u8 };
 fn takeToken(value: []const u8) ?Token {
-    const trimmed = trim(value);
-    if (trimmed.len == 0) return null;
-    var end: usize = 0;
-    while (end < trimmed.len and !isSpace(trimmed[end])) : (end += 1) {}
-    return .{
-        .token = trimmed[0..end],
-        .rest = if (end >= trimmed.len) "" else trim(trimmed[end..]),
-    };
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = r4os.arguments.ArgCursor.init(value, .{}, &failure) catch return null;
+    const token = (cursor.next() catch return null) orelse return null;
+    return .{ .token = token.bytes(value) catch return null, .rest = cursor.remainingArguments() catch return null };
 }
 
 fn parsePort(value: []const u8) ?u16 {
     if (value.len == 0) return null;
-    var out: u32 = 0;
-    for (value) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        out = out * 10 + @as(u32, ch - '0');
-        if (out == 0 or out > 65535) return null;
-    }
-    return @intCast(out);
+    for (value) |byte| if (byte < '0' or byte > '9') return null;
+    const number = std.fmt.parseInt(u16, value, 10) catch return null;
+    return if (number == 0) null else number;
 }
 
-fn parseIpv4(value: []const u8) ?[4]u8 {
-    var out: [4]u8 = .{0} ** 4;
-    var part: usize = 0;
-    var accum: u16 = 0;
-    var digits: usize = 0;
-
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const ch = value[index];
-        if (ch >= '0' and ch <= '9') {
-            accum = accum * 10 + @as(u16, ch - '0');
-            if (accum > 255) return null;
-            digits += 1;
-            if (digits > 3) return null;
-        } else if (ch == '.') {
-            if (digits == 0 or part >= 3) return null;
-            out[part] = @intCast(accum);
-            part += 1;
-            accum = 0;
-            digits = 0;
-        } else {
-            return null;
-        }
-    }
-    if (digits == 0 or part != 3) return null;
-    out[part] = @intCast(accum);
-    return out;
-}
-
-fn writeIpv4(ctx: *const App, ip: [4]u8) void {
-    ctx.printU64(ip[0]);
-    ctx.putc('.');
-    ctx.printU64(ip[1]);
-    ctx.putc('.');
-    ctx.printU64(ip[2]);
-    ctx.putc('.');
-    ctx.printU64(ip[3]);
+fn writeAddress(ctx: *const App, address: r4os.abi.NetworkAddress) void {
+    var buffer: [80]u8 = undefined;
+    ctx.write(r4os.network_family.addressText(&buffer, address) catch "unknown");
 }
 
 fn bytesEqual(a: []const u8, b: []const u8) bool {
